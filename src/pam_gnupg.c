@@ -1,9 +1,11 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 #include <wait.h>
 
@@ -125,6 +127,7 @@ void wipestr(char *data) {
 }
 
 void cleanup_token(pam_handle_t *pamh, void *data, int error_status) {
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "clearing token");
     wipestr(data);
 }
 
@@ -158,12 +161,14 @@ void restore_sigs(const struct sigaction *old) {
     free((void *) old);
 }
 
-int run_as_user(const struct userinfo *user, const char * const cmd[], int *input, char **env) {
+int run_as_user(const struct userinfo *user, const char * const cmd[], int *input, char **env,
+                pam_handle_t *pamh) {
     int inp[2] = {-1, -1};
     int pid;
     int dev_null;
 
     if (pipe(inp) < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "failed to open pipe");
         *input = -1;
         return 0;
     }
@@ -171,6 +176,7 @@ int run_as_user(const struct userinfo *user, const char * const cmd[], int *inpu
 
     switch (pid = fork()) {
     case -1:
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "fork() failed (%s)", strerror(errno));
         close_safe(inp[READ_END]);
         close_safe(inp[WRITE_END]);
         *input = -1;
@@ -187,6 +193,7 @@ int run_as_user(const struct userinfo *user, const char * const cmd[], int *inpu
     /* We're in the child process now */
 
     if (dup2(inp[READ_END], STDIN_FILENO) < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "child: dup2() failed (%s)", strerror(errno));
         exit(EXIT_FAILURE);
     }
     close_safe(inp[READ_END]);
@@ -201,6 +208,7 @@ int run_as_user(const struct userinfo *user, const char * const cmd[], int *inpu
     if (seteuid(getuid()) < 0 || setegid(getgid()) < 0 ||
         setgid(user->gid) < 0 || setuid(user->uid) < 0 ||
         setegid(user->gid) < 0 || seteuid(user->uid) < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "child: failed to set uid/gid");
         exit(EXIT_FAILURE);
     }
 
@@ -209,6 +217,7 @@ int run_as_user(const struct userinfo *user, const char * const cmd[], int *inpu
     } else {
         execv(cmd[0], (char * const *) cmd);
     }
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "child: execve() failed (%s)", strerror(errno));
     exit(EXIT_FAILURE);
 }
 
@@ -217,22 +226,26 @@ int preset_passphrase(pam_handle_t *pamh, const char *tok, int autostart) {
 
     struct userinfo *user;
     if (!get_userinfo(pamh, &user)) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "failed to get user info");
         return FALSE;
     }
 
     char *keygrip_file;
     if (asprintf(&keygrip_file, "%s/.pam-gnupg", user->home) < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "asprintf() failed");
         goto end;
     }
     FILE *file = fopen(keygrip_file, "r");
     free(keygrip_file);
     if (file == NULL) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "failed to open ~/.pam-gnupg (%s)", strerror(errno));
         return FALSE;
     }
 
     struct sigaction *handlers = NULL;
     setup_sigs(&handlers);
     if (handlers == NULL) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "failed to setup signal handlers");
         goto end;
     }
 
@@ -247,17 +260,20 @@ int preset_passphrase(pam_handle_t *pamh, const char *tok, int autostart) {
 
     int input;
     char **env = pam_getenvlist(pamh);
-    const int pid = run_as_user(user, cmd, &input, env);
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "running gpg-preset-passphrase, autostart=%d", autostart);
+    const int pid = run_as_user(user, cmd, &input, env, pamh);
     if (env != NULL) {
         free(env);
     }
     if (pid == 0 || input < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "starting gpg-connect-agent failed");
         goto end;
     }
 
     char *presetcmd;
     const int presetlen = asprintf(&presetcmd, "PRESET_PASSPHRASE xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx -1 %s\n", tok);
     if (presetlen < 0) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "asprintf() failed");
         presetcmd = NULL;
         goto end;
     }
@@ -278,9 +294,13 @@ int preset_passphrase(pam_handle_t *pamh, const char *tok, int autostart) {
             /* We hit eol sooner than expected. */
             continue;
         }
+        *(keygrip + KEYGRIP_LENGTH) = '\0';
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "presetting keygrip %s", keygrip);
+        *(keygrip + KEYGRIP_LENGTH) = ' ';
         if (write(input, presetcmd, presetlen) < 0) {
             /* If anything goes wrong, we just stop here. No attempt is made to
              * clean passphrases that were set in a previous iteration. */
+            pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "write() failed (%s)", strerror(errno));
             close(input);
             goto end;
         }
@@ -288,7 +308,10 @@ int preset_passphrase(pam_handle_t *pamh, const char *tok, int autostart) {
 
     int status;
     close(input);
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "waiting for subprocess");
     waitpid(pid, &status, 0);
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "subprocess finished with exit status %d",
+               WEXITSTATUS(status));
     ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
 end:
@@ -309,8 +332,11 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **ar
     if (pam_get_item(pamh, PAM_AUTHTOK, (const void **) &tok) == PAM_SUCCESS && tok != NULL) {
         tok = hexify(tok);
         if (tok != NULL) {
+            pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "storing auth token");
             pam_set_data(pamh, "pam-gnupg-token", (void *) tok, cleanup_token);
         }
+    } else {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "failed to obtain auth token");
     }
     return PAM_SUCCESS;
 }
@@ -323,7 +349,9 @@ int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
         tok == NULL) {
         return PAM_SUCCESS;
     }
+    pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "attempting to unlock");
     if (!preset_passphrase(pamh, tok, FALSE)) {
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "unlocking failed");
         return PAM_IGNORE;
     }
     pam_set_data(pamh, "pam-gnupg-token", NULL, NULL);
@@ -333,7 +361,10 @@ int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
 int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     const char *tok = NULL;
     if (pam_get_data(pamh, "pam-gnupg-token", (const void **) &tok) == PAM_SUCCESS && tok != NULL) {
-        preset_passphrase(pamh, tok, (argc == 0 || strcmp(argv[0], "no-autostart") != 0));
+        pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "attempting to unlock");
+        if (!preset_passphrase(pamh, tok, (argc == 0 || strcmp(argv[0], "no-autostart") != 0))) {
+            pam_syslog(pamh, LOG_AUTH | LOG_DEBUG, "unlocking failed");
+        }
         pam_set_data(pamh, "pam-gnupg-token", NULL, NULL);
     }
     return PAM_SUCCESS;
